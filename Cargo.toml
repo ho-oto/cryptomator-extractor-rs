@@ -1,0 +1,19 @@
+[package]
+name = "cryptomator-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+aes = "0.8.3"
+aes-gcm = "0.10.3"
+aes-gcm-siv = "0.11.1"
+aes-kw = "0.2.1"
+base32 = "0.4.0"
+hmac = "0.12.1"
+jsonwebtoken = "9.2.0"
+rpassword = "7.3.1"
+scrypt = "0.11.0"
+sha2 = "0.10.8"
+unicode-normalization = "0.1.22"
