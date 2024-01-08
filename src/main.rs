@@ -7,21 +7,20 @@ use aes_kw::Kek;
 use aes_siv::siv::Siv;
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose, Engine as _};
+use byteorder::{BigEndian, ByteOrder};
 use cmac::Cmac;
-use hex_literal::hex;
 use jsonwebtoken;
 use scrypt;
 use serde::Deserialize;
 use serde_json;
 use serde_with::{base64::Base64, serde_as};
+use std::{fs::File, io::Read};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Claims {
-    // jti: String,
     format: i64,
     cipher_combo: String,
-    // shortening_threshold: i64,
 }
 
 #[serde_as]
@@ -105,17 +104,55 @@ fn main() -> Result<()> {
 
     // file header decrypt
     let cipher = Aes256Gcm::new((&primary_master).into());
-    let nonce = hex!("f3 d9 e6 c2 d6 36 b4 49 b6 28 3f d2");
-    let mut payload = hex!("bd e1 85 83 36 e9 c7 a9 d8 18 fe 42 d3 a9 61 26 99 dc b6 79 ff a7 6b 92 86 72 7a d4 74 e3 1a 4c 2f 63 5c bd 1b d9 1c ea");
-    let tag = hex!("17 19 b2 87 3b d4 10 f7 0b 30 9f f7 f2 7e d7 75");
+
+    let mut file = File::open("/Users/hnakano/cryptomator-rs/test/d/2K/723QQ6QB7BXDSTL4RSAGGVO6FLRVNB/_Z61vxqh9srCKQxEHS6hM7OFPZnfPNAwOfDCRtaUS9td3lymVbHGJ_N2oBPE.c9r")?;
+
+    let mut header_nonce = [0; 12];
+    let mut header_payload = [0; 40];
+    let mut header_tag = [0; 16];
+    file.read_exact(&mut header_nonce)?;
+    file.read_exact(&mut header_payload)?;
+    file.read_exact(&mut header_tag)?;
     cipher
-        .decrypt_in_place_detached((&nonce).into(), b"", &mut payload, (&tag).into())
+        .decrypt_in_place_detached(
+            (&header_nonce).into(),
+            b"",
+            &mut header_payload,
+            (&header_tag).into(),
+        )
         .unwrap();
-    println!("{:02x?}", payload);
-    //let (zeros, payload) = payload.split_at(8);
-    println!("{:02x?}", &payload[8..]);
+    ensure!(header_payload[..8] == [u8::MAX; 8], "aaa");
+    let content_key: [u8; 32] = header_payload[8..].try_into()?;
 
     // file body decrypt
+    let cipher = Aes256Gcm::new((&content_key).into());
+    let mut buf = [0; 12 + 32 * 1024 + 16];
+    let mut chunk_num = 0;
+
+    let mut chunk_add_buf = [0; 20];
+    let mut chunk_nonce_buf = [0; 12];
+    let mut chunk_tag_buf = [0; 16];
+
+    chunk_add_buf[8..20].copy_from_slice(&header_nonce);
+
+    while let Ok(n) = file.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        ensure!(n > 12 + 16, "bbb");
+        BigEndian::write_u64(&mut chunk_add_buf[0..8], chunk_num);
+        chunk_nonce_buf.copy_from_slice(&buf[0..12]);
+        chunk_tag_buf.copy_from_slice(&buf[(n - 16)..n]);
+        cipher
+            .decrypt_in_place_detached(
+                (&chunk_nonce_buf).into(),
+                &chunk_add_buf,
+                &mut buf[12..(n - 16)],
+                (&chunk_tag_buf).into(),
+            )
+            .unwrap();
+        chunk_num += 1;
+    }
 
     // file name decrypt
     let mut file_name = general_purpose::URL_SAFE_NO_PAD
