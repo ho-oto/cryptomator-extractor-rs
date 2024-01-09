@@ -3,30 +3,19 @@ use aes_gcm::{
     aes::Aes256,
     Aes256Gcm,
 };
-use aes_kw::Kek;
-use aes_siv::siv::Siv;
-use cmac::Cmac;
-use scrypt;
-use sha1::{Digest, Sha1};
-
-use base32;
+use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use byteorder::{BigEndian, ByteOrder};
-
-use jsonwebtoken;
 use serde::Deserialize;
-use serde_json;
 use serde_with::{base64::Base64, serde_as};
-
-use anyhow::{bail, ensure, Context, Result};
-
+use sha1::{Digest, Sha1};
 use std::io::BufReader;
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::{fs, io::Write};
 use std::{fs::File, io::Read};
 
-type Aes256Siv = Siv<Aes256, Cmac<Aes256>>;
+type Aes256Siv = aes_siv::siv::Siv<Aes256, cmac::Cmac<Aes256>>;
 
 pub struct Vault {
     aes_gcm_cipher: Aes256Gcm,
@@ -38,7 +27,7 @@ pub struct Vault {
 
 impl Vault {
     pub fn new(vault_root_path: &Path, user_passphrase: &str) -> Result<Self> {
-        #[derive(Debug, Deserialize)]
+        #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Claims {
             format: i64,
@@ -46,7 +35,7 @@ impl Vault {
         }
 
         #[serde_as]
-        #[derive(Debug, Deserialize)]
+        #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct MasterKey {
             #[serde_as(as = "Base64")]
@@ -98,7 +87,7 @@ impl Vault {
             )?,
             &mut buf,
         )?;
-        let kek = Kek::try_from(buf)?;
+        let kek = aes_kw::Kek::try_from(buf)?;
         let primary_master = match kek.unwrap(&master_key.primary_master_key, &mut buf) {
             Ok(_) => buf,
             Err(_) => bail!("failed to unwrap master key"),
