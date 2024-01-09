@@ -19,7 +19,7 @@ use serde_with::{base64::Base64, serde_as};
 
 use anyhow::{bail, ensure, Context, Result};
 
-use std::io::BufReader;
+use std::io::{self, BufReader};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::{fs, io::Write};
@@ -133,7 +133,7 @@ fn dir_id_to_vault_path(
 }
 
 fn decrypt_file_name(
-    encrypted_file_path: &Path,
+    encrypted_file_name: &str,
     parent_dir_id: &str,
     parent_tgt_dir_path: &Path,
     cipher: &mut Aes256Siv,
@@ -143,11 +143,7 @@ fn decrypt_file_name(
         "parent_tgt_dir_path should be dir"
     );
     let mut file_name = general_purpose::URL_SAFE.decode(
-        &encrypted_file_path
-            .file_name()
-            .context("not a file")?
-            .to_str()
-            .context("invalid OsStr")?
+        encrypted_file_name
             .strip_suffix(".c9r")
             .context("not .c9r file")?,
     )?;
@@ -211,17 +207,94 @@ fn decrypt_file_body(encrypted_file_path: &Path, cipher: &Aes256Gcm) -> Result<V
     Ok(clear_text)
 }
 
+fn decrypt_dir(
+    parent_dir_id: &str,
+    parent_tgt_dir_path: &Path,
+    vault_root_path: &Path,
+
+    cipher_header: &Aes256Gcm,
+    cipher_name: &mut Aes256Siv,
+) -> Result<()> {
+    let vault_path = dir_id_to_vault_path(vault_root_path, parent_dir_id, cipher_name)?;
+    for entry in vault_path.read_dir()? {
+        if let Ok(entry) = entry {
+            if entry.path().is_file() && entry.file_name() != "dirid.c9r" {
+                println!("{:?}", entry.file_name());
+                let tgt_file_name = decrypt_file_name(
+                    &entry
+                        .path()
+                        .file_name()
+                        .context("not a file")?
+                        .to_str()
+                        .context("invalid OsStr")?,
+                    parent_dir_id,
+                    &parent_tgt_dir_path,
+                    cipher_name,
+                )?;
+                File::create(tgt_file_name)?
+                    .write_all(&decrypt_file_body(&entry.path(), &cipher_header)?)?;
+            }
+            if entry.path().is_dir() {
+                let file_name = if entry.path().join("name.c9r").is_file() {
+                    let mut file_name = String::new();
+                    File::open(&entry.path().join("name.c9r"))?.read_to_string(&mut file_name)?;
+                    file_name
+                } else {
+                    entry.file_name().to_str().context("x")?.to_owned()
+                };
+                if entry.path().join("dir.c9r").is_file() {
+                    let mut dir_id = String::new();
+                    File::open(&entry.path().join("dir.c9r"))?.read_to_string(&mut dir_id)?;
+                    let parent_tgt_dir_path = decrypt_file_name(
+                        &file_name,
+                        parent_dir_id,
+                        parent_tgt_dir_path,
+                        cipher_name,
+                    )?;
+                    fs::create_dir_all(&parent_tgt_dir_path)?;
+                    decrypt_dir(
+                        &dir_id,
+                        &parent_tgt_dir_path,
+                        vault_root_path,
+                        cipher_header,
+                        cipher_name,
+                    )?
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let vault_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample_vault");
-    let vault_tgt_root = Path::new(env!("CARGO_MANIFEST_DIR")); //.join("sample_vault_tgt");
+    let vault_tgt_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("sample_vault_tgt");
     let (cipher_header, mut cipher_name) = get_vault_meta(&vault_root, "password")?;
     let vault_path_of_root = dir_id_to_vault_path(&vault_root, "", &mut cipher_name)?;
+
+    fs::create_dir_all(&vault_tgt_root)?;
+    decrypt_dir(
+        "",
+        &vault_tgt_root,
+        &vault_root,
+        &cipher_header,
+        &mut cipher_name,
+    )?;
     for entry in vault_path_of_root.read_dir()? {
         if let Ok(entry) = entry {
             if entry.path().is_file() && entry.file_name() != "dirid.c9r" {
                 println!("{:?}", entry.file_name());
-                let tgt_file_name =
-                    decrypt_file_name(&entry.path(), "", vault_tgt_root, &mut cipher_name)?;
+                let tgt_file_name = decrypt_file_name(
+                    &entry
+                        .path()
+                        .file_name()
+                        .context("not a file")?
+                        .to_str()
+                        .context("invalid OsStr")?,
+                    "",
+                    &vault_tgt_root,
+                    &mut cipher_name,
+                )?;
                 File::create(tgt_file_name)?
                     .write_all(&decrypt_file_body(&entry.path(), &cipher_header)?)?;
             }
