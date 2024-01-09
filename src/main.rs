@@ -46,6 +46,11 @@ struct MasterKey {
     hmac_master_key: Vec<u8>,
 }
 
+enum NodeKind {
+    File { name: String, content_path: PathBuf },
+    Dir { name: String, id: String },
+}
+
 type Aes256Siv = Siv<Aes256, Cmac<Aes256>>;
 
 fn get_vault_meta(vault_root_path: &Path, user_passphrase: &str) -> Result<(Aes256Gcm, Aes256Siv)> {
@@ -217,41 +222,61 @@ fn decrypt_dir(
     let vault_path = dir_id_to_vault_path(vault_root_path, parent_dir_id, cipher_name)?;
     for entry in vault_path.read_dir()? {
         if let Ok(entry) = entry {
-            if entry.path().is_file() && entry.file_name() != "dirid.c9r" {
-                let tgt_file_name = decrypt_file_name(
-                    &entry
+            if entry.path().is_file() && entry.file_name() == "dirid.c9r" {
+                continue;
+            }
+            let node_kind = if entry.path().is_file() {
+                NodeKind::File {
+                    name: entry
                         .path()
                         .file_name()
                         .context("not a file")?
                         .to_str()
-                        .context("invalid OsStr")?,
-                    parent_dir_id,
-                    &parent_tgt_dir_path,
-                    cipher_name,
-                )?;
-                File::create(tgt_file_name)?
-                    .write_all(&decrypt_file_body(&entry.path(), &cipher_header)?)?;
-            }
-            if entry.path().is_dir() {
-                let file_name = if entry.path().join("name.c9s").is_file() {
-                    let mut file_name = String::new();
-                    File::open(&entry.path().join("name.c9s"))?.read_to_string(&mut file_name)?;
-                    file_name
+                        .context("invalid OsStr")?
+                        .to_owned(),
+                    content_path: entry.path().to_owned(),
+                }
+            } else if entry.path().is_dir() {
+                let name = if entry.path().join("name.c9s").is_file() {
+                    let mut name = String::new();
+                    File::open(&entry.path().join("name.c9s"))?.read_to_string(&mut name)?;
+                    name
                 } else {
-                    entry.file_name().to_str().context("x")?.to_owned()
+                    entry
+                        .file_name()
+                        .to_str()
+                        .context("invalid OsStr")?
+                        .to_owned()
                 };
+                println!("{:?}", entry.path());
                 if entry.path().join("dir.c9r").is_file() {
-                    let mut dir_id = String::new();
-                    File::open(&entry.path().join("dir.c9r"))?.read_to_string(&mut dir_id)?;
-                    let parent_tgt_dir_path = decrypt_file_name(
-                        &file_name,
-                        parent_dir_id,
-                        parent_tgt_dir_path,
-                        cipher_name,
-                    )?;
+                    let mut id = String::new();
+                    File::open(&entry.path().join("dir.c9r"))?.read_to_string(&mut id)?;
+                    NodeKind::Dir { name, id }
+                } else if entry.path().join("contents.c9r").is_file() {
+                    NodeKind::File {
+                        name,
+                        content_path: entry.path().join("contents.c9r"),
+                    }
+                } else {
+                    bail!("unsupported Node type (may be symlink)")
+                }
+            } else {
+                bail!("failed to open entry")
+            };
+            match node_kind {
+                NodeKind::File { name, content_path } => {
+                    let tgt_file_name =
+                        decrypt_file_name(&name, parent_dir_id, parent_tgt_dir_path, cipher_name)?;
+                    File::create(tgt_file_name)?
+                        .write_all(&decrypt_file_body(&content_path, &cipher_header)?)?;
+                }
+                NodeKind::Dir { name, id } => {
+                    let parent_tgt_dir_path =
+                        decrypt_file_name(&name, parent_dir_id, parent_tgt_dir_path, cipher_name)?;
                     fs::create_dir_all(&parent_tgt_dir_path)?;
                     decrypt_dir(
-                        &dir_id,
+                        &id,
                         &parent_tgt_dir_path,
                         vault_root_path,
                         cipher_header,
