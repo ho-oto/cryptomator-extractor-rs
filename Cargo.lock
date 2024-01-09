@@ -207,7 +207,6 @@ dependencies = [
 name = "cryptomator-rs"
 version = "0.1.0"
 dependencies = [
- "aes",
  "aes-gcm",
  "aes-kw",
  "aes-siv",

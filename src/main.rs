@@ -1,18 +1,19 @@
-use aes::Aes256;
 use aes_gcm::{
-    aead::{AeadInPlace, KeyInit},
+    aead::{AeadInPlace, Key, KeyInit},
+    aes::Aes256,
     Aes256Gcm,
 };
 use aes_kw::Kek;
 use aes_siv::siv::Siv;
 use cmac::Cmac;
-use jsonwebtoken;
 use scrypt;
 use sha1::{Digest, Sha1};
 
 use base32;
 use base64::{engine::general_purpose, Engine as _};
 use byteorder::{BigEndian, ByteOrder};
+
+use jsonwebtoken;
 use serde::Deserialize;
 use serde_json;
 use serde_with::{base64::Base64, serde_as};
@@ -50,35 +51,34 @@ type Aes256Siv = Siv<Aes256, Cmac<Aes256>>;
 
 struct Vault {
     aes_gcm_cipher: Aes256Gcm,
-    aes_siv_key: [u8; 64], // aes_siv::Aes256SivAead dose not have method to decrypt without nonce. So we construct aes_siv::siv::Siv with aes_siv_key each time for decryption.
+    // aes_siv::Aes256SivAead dose not have method to decrypt without nonce.
+    // So we construct aes_siv::siv::Siv with key each time for aes-siv decryption.
+    aes_siv_key: Key<Aes256Siv>,
     vault_root_path: PathBuf,
 }
 
 impl Vault {
     pub fn new(vault_root_path: &Path, user_passphrase: &str) -> Result<Self> {
-        use jsonwebtoken::{decode, DecodingKey, Validation};
-
         let vault_jwt = fs::read_to_string(vault_root_path.join("vault.cryptomator"))?;
         let mut buf = [0; 32];
-
-        let mut valid = Validation::new(jsonwebtoken::Algorithm::HS256);
+        // decode jwt without verification
+        let mut valid = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
         valid.insecure_disable_signature_validation();
-        let claims = decode::<Claims>(
+        let jwt_decoded = jsonwebtoken::decode::<Claims>(
             &vault_jwt,
             &jsonwebtoken::DecodingKey::from_secret(b""),
             &valid,
         )?;
-
         ensure!(
-            claims.claims.format == 8 && claims.claims.cipher_combo == "SIV_GCM",
+            jwt_decoded.claims.format == 8 && jwt_decoded.claims.cipher_combo == "SIV_GCM",
             "unsupported vault format"
         );
-        let kid = claims.header.kid.context("kid is required")?;
+        let kid = jwt_decoded.header.kid.context("kid is required")?;
         let master_key_file_name = kid
             .strip_prefix("masterkeyfile:")
             .context("unsupported kid format")?;
-
+        // read master-key file
         let master_key: MasterKey = serde_json::from_reader(BufReader::new(File::open(
             vault_root_path.join(master_key_file_name),
         )?))?;
@@ -86,6 +86,7 @@ impl Vault {
             master_key.scrypt_cost_param.is_power_of_two(),
             "scrypt_cost_param is not power of two"
         );
+        // unwrap secrets
         scrypt::scrypt(
             user_passphrase.as_bytes(),
             &master_key.scrypt_salt,
@@ -98,7 +99,6 @@ impl Vault {
             &mut buf,
         )?;
         let kek = Kek::try_from(buf)?;
-
         let primary_master = match kek.unwrap(&master_key.primary_master_key, &mut buf) {
             Ok(_) => buf,
             Err(_) => bail!("failed to unwrap master key"),
@@ -107,26 +107,30 @@ impl Vault {
             Ok(_) => buf,
             Err(_) => bail!("failed to unwrap MAC key"),
         };
-
-        let mut valid = Validation::new(claims.header.alg);
+        // validate jwt
+        let mut valid = jsonwebtoken::Validation::new(jwt_decoded.header.alg);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
-        decode::<Claims>(
+        jsonwebtoken::decode::<Claims>(
             &vault_jwt,
-            &DecodingKey::from_secret(&[primary_master, mac_master].concat()),
+            &jsonwebtoken::DecodingKey::from_secret(&[primary_master, mac_master].concat()),
             &valid,
-        )?;
-
+        )
+        .context("failed to verify vault.cryptomator")?;
+        // construct cipher
+        let mut aes_siv_key = [0; 64];
+        aes_siv_key[..32].copy_from_slice(&mac_master);
+        aes_siv_key[32..].copy_from_slice(&primary_master);
         Ok(Self {
             aes_gcm_cipher: Aes256Gcm::new(primary_master[..].into()),
-            aes_siv_key: [mac_master, primary_master].concat()[..64].try_into()?,
+            aes_siv_key: aes_siv_key.into(),
             vault_root_path: vault_root_path.to_owned(),
         })
     }
 
     fn path_in_vault(&self, dir_id: &str) -> Result<PathBuf> {
         let mut dir_id: Vec<_> = dir_id.as_bytes().to_vec();
-        if let Err(_) = Aes256Siv::new(&self.aes_siv_key.into())
-            .encrypt_in_place(iter::empty::<&[u8]>(), &mut dir_id)
+        if let Err(_) =
+            Aes256Siv::new(&self.aes_siv_key).encrypt_in_place(iter::empty::<&[u8]>(), &mut dir_id)
         {
             bail!("failed to encrypt dir id");
         }
@@ -155,7 +159,7 @@ impl Vault {
         )?;
         let (siv_tag, file_name_body) = file_name.split_at_mut(16);
         let mut file_name_body: Vec<u8> = file_name_body.into();
-        if let Err(_) = Aes256Siv::new(&self.aes_siv_key.into()).decrypt_in_place_detached(
+        if let Err(_) = Aes256Siv::new(&self.aes_siv_key).decrypt_in_place_detached(
             [parent_dir_id.as_bytes()],
             &mut file_name_body,
             siv_tag[..16].into(),
@@ -221,12 +225,14 @@ impl Vault {
 
         fs::create_dir_all(&parent_dir_path_in_tgt)?;
         let vault_path = self.path_in_vault(parent_dir_id)?;
+
         for entry in vault_path.read_dir()? {
             if let Ok(entry) = entry {
-                if entry.path().is_file() && entry.file_name() == "dirid.c9r" {
+                let path = entry.path();
+                if path.is_file() && entry.file_name() == "dirid.c9r" {
                     continue;
                 }
-                let node = if entry.path().is_file() {
+                let node = if path.is_file() {
                     Node::File {
                         name: entry
                             .path()
@@ -235,12 +241,12 @@ impl Vault {
                             .to_str()
                             .context("invalid OsStr")?
                             .to_owned(),
-                        content_path: entry.path().to_owned(),
+                        content_path: path.to_owned(),
                     }
-                } else if entry.path().is_dir() {
-                    let name = if entry.path().join("name.c9s").is_file() {
+                } else if path.is_dir() {
+                    let name = if path.join("name.c9s").is_file() {
                         let mut name = String::new();
-                        File::open(&entry.path().join("name.c9s"))?.read_to_string(&mut name)?;
+                        File::open(&path.join("name.c9s"))?.read_to_string(&mut name)?;
                         name
                     } else {
                         entry
@@ -249,14 +255,14 @@ impl Vault {
                             .context("invalid OsStr")?
                             .to_owned()
                     };
-                    if entry.path().join("dir.c9r").is_file() {
+                    if path.join("dir.c9r").is_file() {
                         let mut id = String::new();
-                        File::open(&entry.path().join("dir.c9r"))?.read_to_string(&mut id)?;
+                        File::open(&path.join("dir.c9r"))?.read_to_string(&mut id)?;
                         Node::Dir { name, id }
-                    } else if entry.path().join("contents.c9r").is_file() {
+                    } else if path.join("contents.c9r").is_file() {
                         Node::File {
                             name,
-                            content_path: entry.path().join("contents.c9r"),
+                            content_path: path.join("contents.c9r"),
                         }
                     } else {
                         bail!("unsupported Node type (may be symlink)")
