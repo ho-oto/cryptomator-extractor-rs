@@ -194,19 +194,19 @@ impl Vault {
         let mut clear_text: Vec<u8> = vec![];
         let mut buf = [0; 12 + (1024 * 32) + 16];
         let mut chunk_num = 0;
-        let mut chunk_add_buf = [0; 20];
-        chunk_add_buf[8..].copy_from_slice(&header_nonce);
+        let mut chunk_aad_buf = [0; 20];
+        chunk_aad_buf[8..].copy_from_slice(&header_nonce);
         while let Ok(n) = file.read(&mut buf) {
             if n == 0 {
                 break;
             }
             ensure!(n > 12 + 16, "invalid chunk size");
-            BigEndian::write_u64(&mut chunk_add_buf[..8], chunk_num);
+            BigEndian::write_u64(&mut chunk_aad_buf[..8], chunk_num);
             let (chunk_nonce, rest) = buf.split_at_mut(12);
             let (body, tag) = rest.split_at_mut(n - 12 - 16);
             if let Err(_) = cipher.decrypt_in_place_detached(
                 chunk_nonce[..12].into(),
-                &chunk_add_buf,
+                &chunk_aad_buf,
                 body,
                 tag[..16].into(),
             ) {
