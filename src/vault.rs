@@ -26,7 +26,7 @@ pub struct Vault {
 }
 
 impl Vault {
-    pub fn new(vault_root_path: &Path, user_passphrase: &str) -> Result<Self> {
+    pub fn new(vault_root_path: &Path, passphrase: &str) -> Result<Self> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Claims {
@@ -48,8 +48,10 @@ impl Vault {
             hmac_master_key: Vec<u8>,
         }
 
-        let vault_jwt = fs::read_to_string(vault_root_path.join("vault.cryptomator"))?;
+        let vault_jwt = fs::read_to_string(vault_root_path.join("vault.cryptomator"))
+            .context("failed to open vault.cryptomator")?;
         let mut buf = [0; 32];
+
         // decode jwt without verification
         let mut valid = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
@@ -58,7 +60,8 @@ impl Vault {
             &vault_jwt,
             &jsonwebtoken::DecodingKey::from_secret(b""),
             &valid,
-        )?;
+        )
+        .context("failed to decode JWT")?;
         ensure!(
             jwt_decoded.claims.format == 8 && jwt_decoded.claims.cipher_combo == "SIV_GCM",
             "unsupported vault format"
@@ -67,17 +70,21 @@ impl Vault {
         let master_key_file_name = kid
             .strip_prefix("masterkeyfile:")
             .context("unsupported kid format")?;
+
         // read master-key file
-        let master_key: MasterKey = serde_json::from_reader(BufReader::new(File::open(
-            vault_root_path.join(master_key_file_name),
-        )?))?;
+        let master_key: MasterKey = serde_json::from_reader(BufReader::new(
+            File::open(vault_root_path.join(master_key_file_name))
+                .context("failed to open masterkeyfile")?,
+        ))
+        .context("unsupported masterkeyfile format")?;
         ensure!(
             master_key.scrypt_cost_param.is_power_of_two(),
             "scrypt_cost_param is not power of two"
         );
+
         // unwrap secrets
         scrypt::scrypt(
-            user_passphrase.as_bytes(),
+            passphrase.as_bytes(),
             &master_key.scrypt_salt,
             &scrypt::Params::new(
                 master_key.scrypt_cost_param.ilog2().try_into()?,
@@ -96,6 +103,7 @@ impl Vault {
             Ok(_) => buf,
             Err(_) => bail!("failed to unwrap MAC key"),
         };
+
         // validate jwt
         let mut valid = jsonwebtoken::Validation::new(jwt_decoded.header.alg);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
@@ -104,7 +112,8 @@ impl Vault {
             &jsonwebtoken::DecodingKey::from_secret(&[primary_master, mac_master].concat()),
             &valid,
         )
-        .context("failed to verify vault.cryptomator")?;
+        .context("failed to verify signature of vault.cryptomator")?;
+
         // construct cipher
         let mut aes_siv_key = [0; 64];
         aes_siv_key[..32].copy_from_slice(&mac_master);
