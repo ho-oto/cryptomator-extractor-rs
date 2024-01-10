@@ -135,8 +135,8 @@ impl Vault {
         let mut hasher = Sha1::new();
         hasher.update(dir_id);
         let result = hasher.finalize();
-        let dir_name = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &result);
-        let (parent, child) = dir_name.split_at(2);
+        let dir_id_hash = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &result);
+        let (parent, child) = dir_id_hash.split_at(2);
         Ok(self.vault_root_path.join("d").join(parent).join(child))
     }
 
@@ -172,9 +172,12 @@ impl Vault {
         let mut header_nonce = [0; 12];
         let mut header_payload = [0; 40];
         let mut header_tag = [0; 16];
-        file.read_exact(&mut header_nonce)?;
-        file.read_exact(&mut header_payload)?;
-        file.read_exact(&mut header_tag)?;
+        file.read_exact(&mut header_nonce)
+            .context("failed to read file header")?;
+        file.read_exact(&mut header_payload)
+            .context("failed to read file header")?;
+        file.read_exact(&mut header_tag)
+            .context("failed to read file header")?;
         if let Err(_) = self.aes_gcm_cipher.decrypt_in_place_detached(
             (&header_nonce).into(),
             b"",
@@ -218,7 +221,7 @@ impl Vault {
     fn decrypt_dir(&self, parent_dir_id: &str, parent_dir_path_in_tgt: &Path) -> Result<()> {
         enum Node {
             File { name: String, content_path: PathBuf },
-            Dir { name: String, id: String },
+            Dir { name: String, dir_id: String },
         }
 
         fs::create_dir_all(&parent_dir_path_in_tgt)?;
@@ -227,19 +230,21 @@ impl Vault {
         for entry in vault_path.read_dir()? {
             if let Ok(entry) = entry {
                 let path = entry.path();
-                if path.is_file() && entry.file_name() == "dirid.c9r" {
+                let name = path
+                    .file_name()
+                    .context("failed to get file name")?
+                    .to_str()
+                    .context("invalid OsStr")?
+                    .to_owned();
+
+                if name == "dirid.c9r" {
                     continue;
                 }
+
                 let node = if path.is_file() {
                     Node::File {
-                        name: entry
-                            .path()
-                            .file_name()
-                            .context("not a file")?
-                            .to_str()
-                            .context("invalid OsStr")?
-                            .to_owned(),
-                        content_path: path.to_owned(),
+                        name,
+                        content_path: path,
                     }
                 } else if path.is_dir() {
                     let name = if path.join("name.c9s").is_file() {
@@ -247,27 +252,24 @@ impl Vault {
                         File::open(&path.join("name.c9s"))?.read_to_string(&mut name)?;
                         name
                     } else {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .context("invalid OsStr")?
-                            .to_owned()
+                        name
                     };
                     if path.join("dir.c9r").is_file() {
-                        let mut id = String::new();
-                        File::open(&path.join("dir.c9r"))?.read_to_string(&mut id)?;
-                        Node::Dir { name, id }
+                        let mut dir_id = String::new();
+                        File::open(&path.join("dir.c9r"))?.read_to_string(&mut dir_id)?;
+                        Node::Dir { name, dir_id }
                     } else if path.join("contents.c9r").is_file() {
                         Node::File {
                             name,
                             content_path: path.join("contents.c9r"),
                         }
                     } else {
-                        bail!("unsupported Node type (may be symlink)")
+                        bail!("symbolic link is unsupported")
                     }
                 } else {
                     bail!("failed to open entry")
                 };
+
                 match node {
                     Node::File { name, content_path } => {
                         let tgt_file_name =
@@ -275,11 +277,10 @@ impl Vault {
                         File::create(tgt_file_name)?
                             .write_all(&self.decrypt_file_content(&content_path)?)?;
                     }
-                    Node::Dir { name, id } => {
-                        let parent_tgt_dir_path =
+                    Node::Dir { name, dir_id } => {
+                        let dir_path_in_tgt =
                             self.decrypt_file_path(&name, parent_dir_id, parent_dir_path_in_tgt)?;
-                        fs::create_dir_all(&parent_tgt_dir_path)?;
-                        self.decrypt_dir(&id, &parent_tgt_dir_path)?
+                        self.decrypt_dir(&dir_id, &dir_path_in_tgt)?
                     }
                 }
             }
@@ -287,7 +288,7 @@ impl Vault {
         Ok(())
     }
 
-    pub fn decrypt_dir_from_root(&self, parent_dir_path_in_tgt: &Path) -> Result<()> {
+    pub fn decrypt(&self, parent_dir_path_in_tgt: &Path) -> Result<()> {
         self.decrypt_dir("", parent_dir_path_in_tgt)
     }
 }

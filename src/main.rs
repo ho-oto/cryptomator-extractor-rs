@@ -11,5 +11,5 @@ fn main() -> Result<()> {
     let vault_root = Path::new(m.get_one::<String>("vault").unwrap());
     let vault_tgt_root = Path::new(m.get_one::<String>("target").unwrap());
     let passphrase = rpassword::prompt_password("Your passphrase: ")?;
-    vault::Vault::new(&vault_root, &passphrase)?.decrypt_dir_from_root(&vault_tgt_root)
+    vault::Vault::new(&vault_root, &passphrase)?.decrypt(&vault_tgt_root)
 }
