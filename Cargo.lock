@@ -285,7 +285,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cryptomator-rs"
+name = "cryptomator-extractor"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
