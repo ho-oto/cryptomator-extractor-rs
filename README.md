@@ -20,7 +20,7 @@ At this stage, it does not support symbolic links.
 ## Usage
 
 Specify the root path of the vault, which is the directory where the vault.cryptomator file resides,
-and then define the target path for decryption.
+and the target path for decryption.
 The decrypted contents of the vault will be generated inside the specified target directory.
 
 ```bash
