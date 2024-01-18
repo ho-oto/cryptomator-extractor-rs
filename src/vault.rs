@@ -1,17 +1,19 @@
 // RustCrypto
-use aead::{AeadInPlace, Key, KeyInit};
+use aead::{AeadInPlace as _, Key, KeyInit as _};
 use aes::Aes256;
 use aes_gcm::Aes256Gcm;
+use aes_kw::Kek;
 use aes_siv::siv::Siv;
 use cmac::Cmac;
-use digest::{core_api::CoreWrapper, Digest};
+use digest::{core_api::CoreWrapper, Digest as _};
 use sha1::Sha1Core;
 
-use anyhow::{bail, ensure, Context, Result};
-use byteorder::{BigEndian, ByteOrder};
+use anyhow::{bail, ensure, Context as _, Result};
+use byteorder::{BigEndian, ByteOrder as _};
 use data_encoding::{BASE32, BASE64, BASE64URL};
 use jsonwebtoken::{decode as jwt_decode, Algorithm::HS256, DecodingKey, Validation};
 use serde::Deserialize;
+use url::Url;
 
 use std::fs;
 use std::fs::File;
@@ -57,20 +59,18 @@ impl Vault {
         let mut valid = Validation::new(HS256);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
         valid.insecure_disable_signature_validation();
-        let jwt_decoded =
-            jwt_decode::<Claims>(&vault_jwt, &key, &valid).context("failed to decode JWT")?;
+        let jwt = jwt_decode::<Claims>(&vault_jwt, &key, &valid).context("failed to decode JWT")?;
+        let kid = Url::parse(&jwt.header.kid.context("kid is required")?)?;
         ensure!(
-            jwt_decoded.claims.format == 8 && jwt_decoded.claims.cipher_combo == "SIV_GCM",
+            kid.scheme() == "masterkeyfile"
+                && jwt.claims.format == 8
+                && jwt.claims.cipher_combo == "SIV_GCM",
             "unsupported vault format"
         );
-        let kid = jwt_decoded.header.kid.context("kid is required")?;
-        let master_key_file_name = kid
-            .strip_prefix("masterkeyfile:")
-            .context("unsupported kid format")?;
 
         // read master-key file
         let master_key = serde_json::from_str::<MasterKey>(
-            &fs::read_to_string(root_of_vault.join(master_key_file_name))
+            &fs::read_to_string(root_of_vault.join(kid.path()))
                 .context("failed to open masterkeyfile")?,
         )
         .context("unsupported masterkeyfile format")?;
@@ -91,7 +91,7 @@ impl Vault {
             )?,
             &mut buf,
         )?;
-        let kek = aes_kw::Kek::try_from(buf)?;
+        let kek = Kek::try_from(buf)?;
         let primary_master = match kek.unwrap(
             &BASE64.decode(master_key.primary_master_key.as_bytes())?,
             &mut buf,
@@ -126,14 +126,14 @@ impl Vault {
     }
 
     fn path_in_vault(&self, dir_id: &str) -> Result<PathBuf> {
-        let mut dir_id: Vec<_> = dir_id.as_bytes().to_vec();
+        let mut id = dir_id.as_bytes().to_vec();
         if let Err(_) =
-            Aes256Siv::new(&self.aes_siv_key).encrypt_in_place(iter::empty::<&[u8]>(), &mut dir_id)
+            Aes256Siv::new(&self.aes_siv_key).encrypt_in_place(iter::empty::<&[u8]>(), &mut id)
         {
-            bail!("failed to encrypt dir_id");
+            bail!("failed to encrypt dir_id: {}", dir_id);
         };
         let mut hasher = CoreWrapper::from_core(Sha1Core::default());
-        hasher.update(dir_id);
+        hasher.update(id);
         let result = hasher.finalize();
         let dir_id_hash = BASE32.encode(&result);
         let (parent, child) = dir_id_hash.split_at(2);
@@ -160,7 +160,7 @@ impl Vault {
             &mut file_name_body,
             siv_tag[..16].into(),
         ) {
-            bail!("failed to decrypt file name")
+            bail!("failed to decrypt file name: {}", encrypted_name)
         }
         Ok(parent_in_tgt.join(&String::from_utf8(file_name_body)?))
     }
@@ -171,34 +171,40 @@ impl Vault {
         let mut header_payload = [0; 40];
         let mut header_tag = [0; 16];
         file.read_exact(&mut header_nonce)
-            .context("failed to read nonce in file header")?;
+            .with_context(|| format!("failed to read header nonce: {:?}", encrypted_file))?;
         file.read_exact(&mut header_payload)
-            .context("failed to read payload in file header")?;
+            .with_context(|| format!("failed to read header payload: {:?}", encrypted_file))?;
         file.read_exact(&mut header_tag)
-            .context("failed to read tag in file header")?;
+            .with_context(|| format!("failed to read header tag: {:?}", encrypted_file))?;
         if let Err(_) = self.aes_gcm_cipher.decrypt_in_place_detached(
             (&header_nonce).into(),
             b"",
             &mut header_payload,
             (&header_tag).into(),
         ) {
-            bail!("failed to decrypt file header");
+            bail!("failed to decrypt file header: {:?}", encrypted_file);
         }
         ensure!(
             header_payload[..8] == [0xFF; 8],
-            "header payload should start with 0xFFFFFFFFFFFFFFFF"
+            "header payload should start with 0xFF_FF_FF_FF_FF_FF_FF_FF: {:?}",
+            encrypted_file
         );
         let cipher = Aes256Gcm::new(header_payload[8..].into());
         let mut buf = [0; 12 + (1024 * 32) + 16];
         let mut chunk_num = 0;
         let mut chunk_aad_buf = [0; 20];
         chunk_aad_buf[8..].copy_from_slice(&header_nonce);
-        let mut output: Vec<u8> = vec![];
+        let mut output = Vec::<u8>::new();
         while let Ok(n) = file.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            ensure!(n > 12 + 16, "invalid chunk size");
+            ensure!(
+                n > 12 + 16,
+                "size of chunk {} in {:?} is invalid",
+                chunk_num,
+                encrypted_file
+            );
             BigEndian::write_u64(&mut chunk_aad_buf[..8], chunk_num);
             let (chunk_nonce, rest) = buf.split_at_mut(12);
             let (body, tag) = rest.split_at_mut(n - 12 - 16);
@@ -209,7 +215,11 @@ impl Vault {
                 tag[..16].into(),
             ) {
                 Ok(()) => output.extend_from_slice(body),
-                Err(_) => bail!("failed to decrypt file chunk"),
+                Err(_) => bail!(
+                    "failed to decrypt file chunk {} in {:?}",
+                    chunk_num,
+                    encrypted_file
+                ),
             }
             chunk_num += 1;
         }
@@ -260,7 +270,7 @@ impl Vault {
                         bail!("symbolic link is unsupported")
                     }
                 } else {
-                    bail!("failed to open entry")
+                    bail!("failed to open entry: {:?}", path)
                 };
 
                 let path = self.path_in_tgt(&name, parent_dir_id, parent_in_tgt)?;
