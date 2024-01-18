@@ -1,32 +1,36 @@
-use aes_gcm::{
-    aead::{AeadInPlace, Key, KeyInit},
-    aes::Aes256,
-    Aes256Gcm,
-};
+// RustCrypto
+use aead::{AeadInPlace, Key, KeyInit};
+use aes::Aes256;
+use aes_gcm::Aes256Gcm;
+use aes_siv::siv::Siv;
+use cmac::Cmac;
+use digest::{core_api::CoreWrapper, Digest};
+use sha1::Sha1Core;
+
 use anyhow::{bail, ensure, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use byteorder::{BigEndian, ByteOrder};
+use data_encoding::{BASE32, BASE64, BASE64URL};
+use jsonwebtoken::{decode as jwt_decode, Algorithm::HS256, DecodingKey, Validation};
 use serde::Deserialize;
-use serde_with::{base64::Base64, serde_as};
-use sha1::{Digest, Sha1};
-use std::io::BufReader;
+
+use std::fs;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::{fs, io::Write};
-use std::{fs::File, io::Read};
 
-type Aes256Siv = aes_siv::siv::Siv<Aes256, cmac::Cmac<Aes256>>;
+type Aes256Siv = Siv<Aes256, Cmac<Aes256>>;
 
 pub struct Vault {
     aes_gcm_cipher: Aes256Gcm,
     // aes_siv::Aes256SivAead dose not have method to decrypt without nonce.
     // So we construct aes_siv::siv::Siv with key each time for aes-siv decryption.
     aes_siv_key: Key<Aes256Siv>,
-    vault_root_path: PathBuf,
+    root_of_vault: PathBuf,
 }
 
 impl Vault {
-    pub fn new(vault_root_path: &Path, passphrase: &str) -> Result<Self> {
+    pub fn new(root_of_vault: &Path, passphrase: &str) -> Result<Self> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Claims {
@@ -34,34 +38,27 @@ impl Vault {
             cipher_combo: String,
         }
 
-        #[serde_as]
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct MasterKey {
-            #[serde_as(as = "Base64")]
-            scrypt_salt: Vec<u8>,
+            scrypt_salt: String,
             scrypt_cost_param: u64,
             scrypt_block_size: u32,
-            #[serde_as(as = "Base64")]
-            primary_master_key: Vec<u8>,
-            #[serde_as(as = "Base64")]
-            hmac_master_key: Vec<u8>,
+            primary_master_key: String,
+            hmac_master_key: String,
         }
 
-        let vault_jwt = fs::read_to_string(vault_root_path.join("vault.cryptomator"))
+        let vault_jwt = fs::read_to_string(root_of_vault.join("vault.cryptomator"))
             .context("failed to open vault.cryptomator")?;
         let mut buf = [0; 32];
 
         // decode jwt without verification
-        let mut valid = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        let key = DecodingKey::from_secret(b"");
+        let mut valid = Validation::new(HS256);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
         valid.insecure_disable_signature_validation();
-        let jwt_decoded = jsonwebtoken::decode::<Claims>(
-            &vault_jwt,
-            &jsonwebtoken::DecodingKey::from_secret(b""),
-            &valid,
-        )
-        .context("failed to decode JWT")?;
+        let jwt_decoded =
+            jwt_decode::<Claims>(&vault_jwt, &key, &valid).context("failed to decode JWT")?;
         ensure!(
             jwt_decoded.claims.format == 8 && jwt_decoded.claims.cipher_combo == "SIV_GCM",
             "unsupported vault format"
@@ -72,10 +69,10 @@ impl Vault {
             .context("unsupported kid format")?;
 
         // read master-key file
-        let master_key: MasterKey = serde_json::from_reader(BufReader::new(
-            File::open(vault_root_path.join(master_key_file_name))
+        let master_key = serde_json::from_str::<MasterKey>(
+            &fs::read_to_string(root_of_vault.join(master_key_file_name))
                 .context("failed to open masterkeyfile")?,
-        ))
+        )
         .context("unsupported masterkeyfile format")?;
         ensure!(
             master_key.scrypt_cost_param.is_power_of_two(),
@@ -85,7 +82,7 @@ impl Vault {
         // unwrap secrets
         scrypt::scrypt(
             passphrase.as_bytes(),
-            &master_key.scrypt_salt,
+            &BASE64.decode(master_key.scrypt_salt.as_bytes())?,
             &scrypt::Params::new(
                 master_key.scrypt_cost_param.ilog2().try_into()?,
                 master_key.scrypt_block_size,
@@ -95,24 +92,27 @@ impl Vault {
             &mut buf,
         )?;
         let kek = aes_kw::Kek::try_from(buf)?;
-        let primary_master = match kek.unwrap(&master_key.primary_master_key, &mut buf) {
-            Ok(_) => buf,
+        let primary_master = match kek.unwrap(
+            &BASE64.decode(master_key.primary_master_key.as_bytes())?,
+            &mut buf,
+        ) {
+            Ok(()) => buf,
             Err(_) => bail!("failed to unwrap master key"),
         };
-        let mac_master = match kek.unwrap(&master_key.hmac_master_key, &mut buf) {
-            Ok(_) => buf,
+        let mac_master = match kek.unwrap(
+            &BASE64.decode(master_key.hmac_master_key.as_bytes())?,
+            &mut buf,
+        ) {
+            Ok(()) => buf,
             Err(_) => bail!("failed to unwrap MAC key"),
         };
 
         // validate jwt
-        let mut valid = jsonwebtoken::Validation::new(jwt_decoded.header.alg);
+        let key = DecodingKey::from_secret(&[primary_master, mac_master].concat());
+        let mut valid = Validation::new(HS256);
         valid.set_required_spec_claims(&["kid", "alg", "typ"]);
-        jsonwebtoken::decode::<Claims>(
-            &vault_jwt,
-            &jsonwebtoken::DecodingKey::from_secret(&[primary_master, mac_master].concat()),
-            &valid,
-        )
-        .context("failed to verify signature of vault.cryptomator")?;
+        jwt_decode::<Claims>(&vault_jwt, &key, &valid)
+            .context("failed to verify signature of vault.cryptomator")?;
 
         // construct cipher
         let mut aes_siv_key = [0; 64];
@@ -121,7 +121,7 @@ impl Vault {
         Ok(Self {
             aes_gcm_cipher: Aes256Gcm::new(primary_master[..].into()),
             aes_siv_key: aes_siv_key.into(),
-            vault_root_path: vault_root_path.to_owned(),
+            root_of_vault: root_of_vault.to_owned(),
         })
     }
 
@@ -130,33 +130,31 @@ impl Vault {
         if let Err(_) =
             Aes256Siv::new(&self.aes_siv_key).encrypt_in_place(iter::empty::<&[u8]>(), &mut dir_id)
         {
-            bail!("failed to encrypt dir id");
-        }
-        let mut hasher = Sha1::new();
+            bail!("failed to encrypt dir_id");
+        };
+        let mut hasher = CoreWrapper::from_core(Sha1Core::default());
         hasher.update(dir_id);
         let result = hasher.finalize();
-        let dir_id_hash = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &result);
+        let dir_id_hash = BASE32.encode(&result);
         let (parent, child) = dir_id_hash.split_at(2);
-        Ok(self.vault_root_path.join("d").join(parent).join(child))
+        Ok(self.root_of_vault.join("d").join(parent).join(child))
     }
 
-    fn decrypt_file_path(
+    fn path_in_tgt(
         &self,
-        encrypted_file_name: &str,
+        encrypted_name: &str,
         parent_dir_id: &str,
-        parent_dir_path_in_tgt: &Path,
+        parent_in_tgt: &Path,
     ) -> Result<PathBuf> {
-        ensure!(
-            parent_dir_path_in_tgt.is_dir(),
-            "parent_tgt_dir_path should be dir"
-        );
-        let mut file_name = general_purpose::URL_SAFE.decode(
-            encrypted_file_name
+        ensure!(parent_in_tgt.is_dir(), "parent_in_tgt should be dir");
+        let mut file_name = BASE64URL.decode(
+            encrypted_name
                 .strip_suffix(".c9r")
-                .context("not .c9r file")?,
+                .context("not .c9r file")?
+                .as_bytes(),
         )?;
         let (siv_tag, file_name_body) = file_name.split_at_mut(16);
-        let mut file_name_body: Vec<u8> = file_name_body.into();
+        let mut file_name_body = file_name_body.to_vec();
         if let Err(_) = Aes256Siv::new(&self.aes_siv_key).decrypt_in_place_detached(
             [parent_dir_id.as_bytes()],
             &mut file_name_body,
@@ -164,20 +162,20 @@ impl Vault {
         ) {
             bail!("failed to decrypt file name")
         }
-        Ok(parent_dir_path_in_tgt.join(&String::from_utf8(file_name_body)?))
+        Ok(parent_in_tgt.join(&String::from_utf8(file_name_body)?))
     }
 
-    fn decrypt_file_content(&self, encrypted_file_path: &Path) -> Result<Vec<u8>> {
-        let mut file = File::open(encrypted_file_path)?;
+    fn plaintext(&self, encrypted_file: &Path) -> Result<Vec<u8>> {
+        let mut file = File::open(encrypted_file)?;
         let mut header_nonce = [0; 12];
         let mut header_payload = [0; 40];
         let mut header_tag = [0; 16];
         file.read_exact(&mut header_nonce)
-            .context("failed to read file header")?;
+            .context("failed to read nonce in file header")?;
         file.read_exact(&mut header_payload)
-            .context("failed to read file header")?;
+            .context("failed to read payload in file header")?;
         file.read_exact(&mut header_tag)
-            .context("failed to read file header")?;
+            .context("failed to read tag in file header")?;
         if let Err(_) = self.aes_gcm_cipher.decrypt_in_place_detached(
             (&header_nonce).into(),
             b"",
@@ -191,11 +189,11 @@ impl Vault {
             "header payload should start with 0xFFFFFFFFFFFFFFFF"
         );
         let cipher = Aes256Gcm::new(header_payload[8..].into());
-        let mut clear_text: Vec<u8> = vec![];
         let mut buf = [0; 12 + (1024 * 32) + 16];
         let mut chunk_num = 0;
         let mut chunk_aad_buf = [0; 20];
         chunk_aad_buf[8..].copy_from_slice(&header_nonce);
+        let mut output: Vec<u8> = vec![];
         while let Ok(n) = file.read(&mut buf) {
             if n == 0 {
                 break;
@@ -204,33 +202,33 @@ impl Vault {
             BigEndian::write_u64(&mut chunk_aad_buf[..8], chunk_num);
             let (chunk_nonce, rest) = buf.split_at_mut(12);
             let (body, tag) = rest.split_at_mut(n - 12 - 16);
-            if let Err(_) = cipher.decrypt_in_place_detached(
+            match cipher.decrypt_in_place_detached(
                 chunk_nonce[..12].into(),
                 &chunk_aad_buf,
                 body,
                 tag[..16].into(),
             ) {
-                bail!("failed to decrypt file chunk")
+                Ok(()) => output.extend_from_slice(body),
+                Err(_) => bail!("failed to decrypt file chunk"),
             }
-            clear_text.extend_from_slice(body);
             chunk_num += 1;
         }
-        Ok(clear_text)
+        Ok(output)
     }
 
-    fn decrypt_dir(&self, parent_dir_id: &str, parent_dir_path_in_tgt: &Path) -> Result<()> {
+    fn decrypt_dir(&self, parent_dir_id: &str, parent_in_tgt: &Path) -> Result<()> {
         enum Node {
-            File { name: String, content_path: PathBuf },
-            Dir { name: String, dir_id: String },
+            Dir { dir_id: String },
+            File { contents_path: PathBuf },
         }
 
-        fs::create_dir_all(&parent_dir_path_in_tgt)?;
+        fs::create_dir_all(&parent_in_tgt)?;
         let vault_path = self.path_in_vault(parent_dir_id)?;
 
         for entry in vault_path.read_dir()? {
             if let Ok(entry) = entry {
                 let path = entry.path();
-                let name = path
+                let mut name = path
                     .file_name()
                     .context("failed to get file name")?
                     .to_str()
@@ -243,25 +241,20 @@ impl Vault {
 
                 let node = if path.is_file() {
                     Node::File {
-                        name,
-                        content_path: path,
+                        contents_path: path,
                     }
                 } else if path.is_dir() {
-                    let name = if path.join("name.c9s").is_file() {
-                        let mut name = String::new();
-                        File::open(&path.join("name.c9s"))?.read_to_string(&mut name)?;
-                        name
-                    } else {
-                        name
+                    if path.join("name.c9s").is_file() {
+                        name = fs::read_to_string(&path.join("name.c9s"))?
                     };
+
                     if path.join("dir.c9r").is_file() {
-                        let mut dir_id = String::new();
-                        File::open(&path.join("dir.c9r"))?.read_to_string(&mut dir_id)?;
-                        Node::Dir { name, dir_id }
+                        Node::Dir {
+                            dir_id: fs::read_to_string(&path.join("dir.c9r"))?,
+                        }
                     } else if path.join("contents.c9r").is_file() {
                         Node::File {
-                            name,
-                            content_path: path.join("contents.c9r"),
+                            contents_path: path.join("contents.c9r"),
                         }
                     } else {
                         bail!("symbolic link is unsupported")
@@ -270,17 +263,11 @@ impl Vault {
                     bail!("failed to open entry")
                 };
 
+                let path = self.path_in_tgt(&name, parent_dir_id, parent_in_tgt)?;
                 match node {
-                    Node::File { name, content_path } => {
-                        let tgt_file_name =
-                            self.decrypt_file_path(&name, parent_dir_id, parent_dir_path_in_tgt)?;
-                        File::create(tgt_file_name)?
-                            .write_all(&self.decrypt_file_content(&content_path)?)?;
-                    }
-                    Node::Dir { name, dir_id } => {
-                        let dir_path_in_tgt =
-                            self.decrypt_file_path(&name, parent_dir_id, parent_dir_path_in_tgt)?;
-                        self.decrypt_dir(&dir_id, &dir_path_in_tgt)?
+                    Node::Dir { dir_id } => self.decrypt_dir(&dir_id, &path)?,
+                    Node::File { contents_path } => {
+                        File::create(path)?.write_all(&self.plaintext(&contents_path)?)?
                     }
                 }
             }
@@ -288,7 +275,7 @@ impl Vault {
         Ok(())
     }
 
-    pub fn decrypt(&self, parent_dir_path_in_tgt: &Path) -> Result<()> {
-        self.decrypt_dir("", parent_dir_path_in_tgt)
+    pub fn decrypt(&self, root_of_tgt: &Path) -> Result<()> {
+        self.decrypt_dir("", root_of_tgt)
     }
 }

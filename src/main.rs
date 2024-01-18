@@ -21,8 +21,8 @@ fn main() -> Result<()> {
                 .required(true),
         )
         .get_matches();
-    let vault_root = Path::new(m.get_one::<String>("vault").unwrap());
-    let vault_tgt_root = Path::new(m.get_one::<String>("target").unwrap());
+    let vault = Path::new(m.get_one::<String>("vault").unwrap());
+    let target = Path::new(m.get_one::<String>("target").unwrap());
     let passphrase = rpassword::prompt_password("Your passphrase: ")?;
-    vault::Vault::new(&vault_root, &passphrase)?.decrypt(&vault_tgt_root)
+    vault::Vault::new(vault, &passphrase)?.decrypt(target)
 }
