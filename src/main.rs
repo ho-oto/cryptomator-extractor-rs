@@ -7,16 +7,16 @@ fn main() -> Result<()> {
     let m = clap::Command::new("cryptomator-extractor")
         .author("Hayate Nakano, nakanodesu@gmail.com")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("decryption tool for Cryptomator vault")
+        .about("simple decryption tool of Cryptomator vault")
         .arg(
             clap::Arg::new("vault")
-                .help("Path of the Cryptomator vault where 'vault.cryptomator' exists")
+                .help("Root of the Cryptomator vault (where 'vault.cryptomator' exists)")
                 .index(1)
                 .required(true),
         )
         .arg(
             clap::Arg::new("target")
-                .help("Path of the decryption target path")
+                .help("Root of the decryption target")
                 .index(2)
                 .required(true),
         )
